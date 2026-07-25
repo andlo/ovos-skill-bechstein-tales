@@ -5,11 +5,11 @@
   "pip_spec": "ovos-skill-bechstein-tales",
   "license": "GPL-3.0-or-later",
   "author": "andlo",
-  "name": "Bechstein Tales (provider)",
-  "description": "Ludwig Bechstein's German fairy tales provider for ovos-common-reading-pipeline-plugin. German only, no translation.",
+  "name": "Bechstein-Märchen (Anbieter)",
+  "description": "Anbieter für Ludwig Bechsteins deutsche Märchen für ovos-common-reading-pipeline-plugin. Nur auf Deutsch, keine Übersetzung.",
   "examples": [
-    "Tell me a story from bechstein",
-    "Read me a fairy tale from ludwig bechstein"
+    "Erzähl mir eine Geschichte von bechstein",
+    "Lies mir eine Geschichte von ludwig bechstein"
   ],
   "tags": [
     "entertainment",
