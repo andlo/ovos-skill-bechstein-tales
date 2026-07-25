@@ -9,7 +9,7 @@
   "description": "Ludwig Bechstein's German fairy tales provider for ovos-common-reading-pipeline-plugin. German only, no translation.",
   "examples": [
     "Tell me a story from bechstein",
-    "Read me a fairy tale from ludwig bechstein"
+    "Tell me a fairy tale from ludwig bechstein"
   ],
   "tags": [
     "entertainment",
