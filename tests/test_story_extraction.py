@@ -1,13 +1,10 @@
-"""Tests for get_story_paragraphs() - includes a regression case for a
-real bug found while building this: get_text(' ', strip=True) inserts a
-spurious space at drop-cap span boundaries ('<span>E</span>s war einmal'
--> 'E s war einmal'), and the source HTML's line-wrapped text nodes
-contain literal newlines that need collapsing."""
-from unittest.mock import MagicMock
-
-import pytest
-import requests
-from conftest import StoryFetchError
+"""Tests for extract_book() - includes a regression case for a real bug
+found while building this: get_text(' ', strip=True) inserts a spurious
+space at drop-cap span boundaries ('<span>E</span>s war einmal' -> 'E s
+war einmal'), and the source HTML's line-wrapped text nodes contain
+literal newlines that need collapsing. test_text_cleanup.py runs it on a
+cut-down real page."""
+from conftest import extract_book
 
 SAMPLE_HTML = """
 <html><body>
@@ -23,53 +20,32 @@ zwei Töchter.</p>
 <p>Es waren vor Zeiten ein König und eine Königin.</p>
 </div>
 </body></html>
-"""
+""".encode("utf-8")
 
 
-def test_get_story_paragraphs_fixes_dropcap_and_linewrap(skill, monkeypatch):
-    fake_response = MagicMock(text=SAMPLE_HTML)
-    fake_response.raise_for_status = MagicMock()
-    monkeypatch.setattr(requests, "get", lambda *a, **kw: fake_response)
+def test_extract_book_fixes_dropcap_and_linewrap():
+    stories, errors = extract_book(SAMPLE_HTML, ["chap_1", "chap_2"])
 
-    paragraphs = skill.get_story_paragraphs({"url": "http://x/book", "anchor": "chap_1"})
-
-    assert paragraphs[0] == "Es war einmal ein Mann und eine Frau, die hatten zwei Töchter."
-    assert paragraphs[1] == "Und die Stieftochter war fromm und gut."
+    assert errors == {}
+    assert stories["chap_1"][0] == "Es war einmal ein Mann und eine Frau, die hatten zwei Töchter."
+    assert stories["chap_1"][1] == "Und die Stieftochter war fromm und gut."
 
 
-def test_get_story_paragraphs_scoped_to_correct_chapter_div(skill, monkeypatch):
-    fake_response = MagicMock(text=SAMPLE_HTML)
-    fake_response.raise_for_status = MagicMock()
-    monkeypatch.setattr(requests, "get", lambda *a, **kw: fake_response)
+def test_extract_book_scoped_to_correct_chapter_div():
+    stories, _ = extract_book(SAMPLE_HTML, ["chap_1", "chap_2"])
 
-    paragraphs = skill.get_story_paragraphs({"url": "http://x/book", "anchor": "chap_2"})
-
-    assert paragraphs == ["Es waren vor Zeiten ein König und eine Königin."]
+    assert stories["chap_2"] == ["Es waren vor Zeiten ein König und eine Königin."]
 
 
-def test_get_story_paragraphs_missing_anchor_raises(skill, monkeypatch):
-    fake_response = MagicMock(text=SAMPLE_HTML)
-    fake_response.raise_for_status = MagicMock()
-    monkeypatch.setattr(requests, "get", lambda *a, **kw: fake_response)
+def test_extract_book_missing_anchor_is_an_error_for_that_story_only():
+    stories, errors = extract_book(SAMPLE_HTML, ["chap_2", "chap_999"])
 
-    with pytest.raises(StoryFetchError):
-        skill.get_story_paragraphs({"url": "http://x/book", "anchor": "chap_999"})
+    assert list(stories) == ["chap_2"]
+    assert "chap_999" in errors["chap_999"]
 
 
-def test_get_book_soup_caches_and_wraps_request_exception(skill, monkeypatch):
-    calls = []
-
-    def fake_get(url, timeout):
-        calls.append(url)
-        return MagicMock(text=SAMPLE_HTML, raise_for_status=MagicMock())
-
-    monkeypatch.setattr(requests, "get", fake_get)
-    skill._get_book_soup("http://x/book")
-    skill._get_book_soup("http://x/book")
-    assert len(calls) == 1  # cached on second call
-
-    def fail(*a, **kw):
-        raise requests.ConnectionError("boom")
-    monkeypatch.setattr(requests, "get", fail)
-    with pytest.raises(StoryFetchError):
-        skill._get_book_soup("http://x/other-book")
+def test_the_page_is_read_as_utf8():
+    """The page is UTF-8 but its HTTP headers do not say so: requests
+    alone would read 'Aschenbrödel' as 'AschenbrÃ¶del'."""
+    stories, _ = extract_book(SAMPLE_HTML, ["chap_1"])
+    assert "Töchter" in stories["chap_1"][0]

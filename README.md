@@ -46,14 +46,34 @@ correctly excluded this way since it has no story paragraphs.
 Two real bugs were found and fixed while building this:
 - **Encoding**: the Gutenberg page doesn't declare a charset in its HTTP
   headers, so `requests` defaulted to ISO-8859-1 and mangled German
-  text (`Aschenbrödel` → `AschenbrÃ¶del`). Fixed by setting
-  `r.encoding = "utf-8"` explicitly.
+  text (`Aschenbrödel` → `AschenbrÃ¶del`). Fixed by decoding the
+  page as UTF-8 explicitly.
 - **Drop caps**: `get_text(' ', strip=True)` inserts a spurious space at
   drop-cap span boundaries (`<span>E</span>s war einmal` → `E s war
   einmal`, splitting the first word). Fixed by extracting text with no
   separator and instead collapsing the source HTML's line-wrapped
   whitespace with a regex - the same class of bug as
   `ovos-skill-ovosblog`'s inline-`<code>` finding, different cause.
+
+## Fetching and what gets read
+
+Reading a story fetches the book from Project Gutenberg once, extracts
+the text of all 80 stories, and keeps it on disk under the skill's cache
+directory (`<XDG cache>/mycroft/skills/<skill_id>/`, one small JSON file
+per story). Any other story, or the same story after a restart, needs no
+request. After 30 days a story is checked again with
+`If-Modified-Since`, which downloads nothing when the book has not
+changed; a change to the extractor (`CACHE_FORMAT`) fetches the book
+again. When a fetch fails, it is not tried again for five minutes, and
+an older copy is read meanwhile if there is one. When the cache
+directory cannot be written, the stories are kept in memory instead.
+Requests say who is asking:
+`ovos-skill-bechstein-tales/<version> (+https://github.com/andlo/ovos-skill-bechstein-tales)`.
+
+What is read is the tale, with its verse line by line (the bird's rhyme
+in *Aschenbrödel* is a `<div class="verse">` and used to be skipped),
+without the page numbers printed in the middle of sentences or the two
+footnotes and their numbers.
 
 ## Languages
 

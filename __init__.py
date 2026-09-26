@@ -29,6 +29,7 @@ browsing/matching needs no internet at all. Internet is only needed when
 actually fetching a specific story's text from Project Gutenberg.
 """
 
+from ovos_config.locations import get_xdg_cache_save_path
 from ovos_workshop.skills import OVOSSkill
 from ovos_bus_client.session import SessionManager
 from ovos_utils.parse import match_one, fuzzy_match
@@ -39,9 +40,14 @@ import requests
 from bs4 import BeautifulSoup
 from functools import lru_cache
 import re
+import gc
+import hashlib
+import importlib.metadata
 import json
 import os
 import random
+import threading
+import time
 import unicodedata
 
 
@@ -195,6 +201,189 @@ def title_aliases(title):
     return tuple(aliases.items())
 
 
+# --- fetching a story's text -------------------------------------------------
+#
+# Project Gutenberg's robot policy discourages automated access, and the
+# text of a public-domain book does not change. So a book is fetched at
+# most once per CACHE_MAX_AGE, whichever of its stories was asked for, and
+# what is kept is the text each of its stories extracts to - one small
+# file per story under the skill's XDG cache directory - never the page
+# (up to 793 KB) or its parse tree (~6 MB in memory).
+
+PYPI_NAME = "ovos-skill-bechstein-tales"
+REPO_URL = "https://github.com/andlo/ovos-skill-bechstein-tales"
+try:
+    SKILL_VERSION = importlib.metadata.version(PYPI_NAME)
+except importlib.metadata.PackageNotFoundError:  # run from a checkout
+    SKILL_VERSION = "unknown"
+# says who is asking and where to find them, instead of python-requests/x
+USER_AGENT = f"{PYPI_NAME}/{SKILL_VERSION} (+{REPO_URL})"
+FETCH_TIMEOUT = 15  # seconds
+# bump whenever a story would extract to different text, so that what an
+# older release cached is fetched again rather than read out as it was
+CACHE_FORMAT = 1
+# a story cached longer ago than this is asked for again, with the page's
+# Last-Modified - an unchanged page answers 304, without a body
+CACHE_MAX_AGE = 30 * 24 * 3600
+# a book that failed to arrive is not asked for again before this, so a
+# Gutenberg outage costs one request every few minutes, not one per story
+# asked for
+FAILURE_BACKOFF = 5 * 60
+
+
+class StoryCache:
+    """The paragraphs each story extracted to, as one small JSON file per
+    story in `directory`, named after where the story is (its book URL
+    and anchor). A file written for another CACHE_FORMAT, URL or anchor is
+    a miss. It never holds more files than the bundled index has stories.
+
+    When `directory` cannot be written, the stories of the last book
+    fetched are kept in memory instead - text only, a small part of what
+    the parsed page took - so reading still works."""
+
+    def __init__(self, directory, log):
+        self.directory = directory
+        self.log = log
+        self._memory = {}
+        self._warned = False
+
+    @staticmethod
+    def _name(url, anchor):
+        return hashlib.sha256(f"{url}#{anchor}".encode("utf-8")).hexdigest()[:32] + ".json"
+
+    def get(self, url, anchor):
+        """The cached record for a story, fresh or not, or None."""
+        name = self._name(url, anchor)
+        record = self._memory.get(name)
+        if record is None:
+            try:
+                with open(os.path.join(self.directory, name), encoding="utf-8") as f:
+                    record = json.load(f)
+            except (OSError, ValueError):
+                return None
+        if not isinstance(record, dict) or record.get("format") != CACHE_FORMAT \
+                or record.get("url") != url or record.get("anchor") != anchor \
+                or not isinstance(record.get("fetched_at"), (int, float)) \
+                or not record.get("paragraphs"):
+            return None
+        return record
+
+    @staticmethod
+    def is_fresh(record):
+        return 0 <= time.time() - record["fetched_at"] < CACHE_MAX_AGE
+
+    def put(self, records):
+        """Store the records of one book's stories."""
+        try:
+            os.makedirs(self.directory, exist_ok=True)
+            for record in records:
+                path = os.path.join(self.directory, self._name(record["url"], record["anchor"]))
+                tmp = f"{path}.{os.getpid()}.tmp"
+                try:
+                    with open(tmp, "w", encoding="utf-8") as f:
+                        json.dump(record, f, ensure_ascii=False)
+                    os.replace(tmp, path)
+                except OSError:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                    raise
+        except OSError as e:
+            if not self._warned:
+                self.log.warning(f"cannot write the story cache in {self.directory} ({e}), "
+                                 f"keeping the last book fetched in memory instead")
+                self._warned = True
+            self._memory = {self._name(r["url"], r["anchor"]): r for r in records}
+
+
+# --- extracting a story's text -----------------------------------------------
+
+LINE_BREAK = "\u2028"  # what a <br> becomes, to tell it from the HTML's own wrapping
+# 'nicht zum Verurzen[1] und', 'sieben Wackelsteine[2] geholt': the number
+# of a footnote, which is not read (see story_paragraphs()), so neither
+# is the number
+FOOTNOTE_MARKER = re.compile(r"\s*\[\d{1,3}\]")
+
+
+def paragraph_text(el):
+    """An element's text as it should be read: every run of whitespace is
+    one space - the page's own line breaks are only where the HTML was
+    wrapped - and only a <br> (LINE_BREAK, see extract_book()) starts a
+    new line.
+
+    Taken with get_text() and no separator: with separator=' ', drop-cap
+    spans like '<span class="drop">E</span>s war einmal' become 'E s war
+    einmal'. The old get_text(strip=True) avoided that but stripped each
+    piece of text before gluing them, so a word before an inline tag was
+    glued to the one after it: 'Als nun die<span class="pagenum">368
+    </span>Braut' was read 'Als nun die368Braut'."""
+    lines = (" ".join(line.split()) for line in el.get_text().split(LINE_BREAK))
+    return "\n".join(line for line in lines if line)
+
+
+def stanza_text(el):
+    """A stanza of the verse in a tale ('Bäumlein, rüttel dich und
+    schüttel dich, ...' in Aschenbrödel), one line per line of verse.
+    Verse is in <div class="verse">, not <p>, and was never read."""
+    lines = (paragraph_text(verse) for verse in el.find_all("div", class_="verse"))
+    return "\n".join(line for line in lines if line)
+
+
+def story_paragraphs(soup, anchor):
+    """Extract a single story's paragraphs from its <div class='chapter'>.
+    Unlike ovos-skill-andrew-lang-tales' flat-HTML anchor scheme, this
+    book properly nests each story's content inside its own div, so we
+    can just take its paragraphs and stanzas in order - no need to guess
+    where the story ends by looking for the next anchor. The book's two
+    footnotes (<p class="footnote">) are left out."""
+    div = soup.find("div", {"class": "chapter", "id": anchor})
+    if div is None:
+        raise StoryFetchError(f"chapter {anchor} not found")
+    paragraphs = []
+    for el in div.find_all(["p", "div"]):
+        classes = el.get("class") or []
+        if el.name == "p" and "footnote" not in classes and el.find_parent("div", class_="stanza") is None:
+            text = paragraph_text(el)
+        elif el.name == "div" and "stanza" in classes:
+            text = stanza_text(el)
+        else:
+            continue
+        text = FOOTNOTE_MARKER.sub("", text).strip()
+        if text:
+            paragraphs.append(text)
+    if not paragraphs:
+        raise StoryFetchError(f"no story text found in chapter {anchor}")
+    return paragraphs
+
+
+def extract_book(content, anchors):
+    """Every story of the book in one go - ({anchor: paragraphs}, {anchor:
+    what went wrong}) - from the page's bytes, so the book never has to be
+    fetched again for another of its stories. The page is UTF-8 but does
+    not say so in its HTTP headers (requests then assumes ISO-8859-1 and
+    reads 'Aschenbrödel' as 'AschenbrÃ¶del'). Page numbers are
+    <span class="pagenum">s in the middle of the text - 416 of them in the
+    80 stories - and are dropped before anything is read. The parse
+    tree is ~6 MB of reference cycles that only the cycle collector frees,
+    so it is collected before returning (~20 ms, once per fetch) rather
+    than whenever the collector next gets to it."""
+    soup = BeautifulSoup(content, "html.parser", from_encoding="utf-8")
+    try:
+        for page_number in soup.find_all("span", class_="pagenum"):
+            page_number.decompose()
+        for br in soup.find_all("br"):
+            br.replace_with(LINE_BREAK)
+        stories, errors = {}, {}
+        for anchor in anchors:
+            try:
+                stories[anchor] = story_paragraphs(soup, anchor)
+            except StoryFetchError as e:
+                errors[anchor] = str(e)
+        return stories, errors
+    finally:
+        del soup
+        gc.collect()
+
+
 class BechsteinTales(OVOSSkill):
 
     @classproperty
@@ -230,7 +419,7 @@ class BechsteinTales(OVOSSkill):
             )
             self.index = {}
             return
-        self._book_soup_cache = {}
+        self._init_story_cache()
         self.index = self._load_index()
         if not self.index:
             self.log.error("No bundled story index found")
@@ -253,48 +442,98 @@ class BechsteinTales(OVOSSkill):
             self.log.error(f"could not read bundled story index {path}: {e}")
             return {}
 
-    def _get_book_soup(self, url):
-        if url in self._book_soup_cache:
-            return self._book_soup_cache[url]
+    def _init_story_cache(self, directory=None):
+        """Where fetched story text is kept - see StoryCache."""
+        self._story_cache = StoryCache(
+            directory or os.path.join(get_xdg_cache_save_path(), "skills", self.skill_id), self.log)
+        self._fetch_lock = threading.Lock()
+        # a book URL, or 'URL#anchor' for a story its page did not yield
+        # -> (time.monotonic() of the failure, what failed)
+        self._failures = {}
+
+    def _check_backoff(self, key):
+        failure = self._failures.get(key)
+        if failure is None:
+            return
+        when, what = failure
+        wait = FAILURE_BACKOFF - (time.monotonic() - when)
+        if wait > 0:
+            raise StoryFetchError(f"{what} (not trying again for {int(wait)} s)")
+        del self._failures[key]
+
+    def _download(self, url, last_modified=None):
+        """(the page's bytes, its Last-Modified), or (None, last_modified)
+        when it has not changed since last_modified."""
+        headers = {"User-Agent": USER_AGENT}
+        if last_modified:
+            headers["If-Modified-Since"] = last_modified
         try:
-            r = requests.get(url, timeout=15)
+            r = requests.get(url, headers=headers, timeout=FETCH_TIMEOUT)
+            if r.status_code == 304 and last_modified:
+                return None, last_modified
             r.raise_for_status()
-            # the page is UTF-8 but doesn't declare a charset in its HTTP
-            # headers, so requests defaults to ISO-8859-1 and mangles
-            # non-ASCII text ('Aschenbrödel' -> 'AschenbrÃ¶del') without this
-            r.encoding = "utf-8"
-            soup = BeautifulSoup(r.text, "html.parser")
         except requests.RequestException as e:
             raise StoryFetchError(f"failed to fetch {url}: {e}") from e
-        self._book_soup_cache[url] = soup
-        return soup
+        return r.content, r.headers.get("Last-Modified")
+
+    def _fetch_book(self, url, anchor, stale=None):
+        """Fetch one book and cache every story of it in the index (and
+        the one at `anchor`). Given a stale cached story, ask with its
+        Last-Modified: a 304 renews every story cached from that same
+        page, and nothing is downloaded."""
+        self._check_backoff(url)
+        last_modified = stale.get("last_modified") if stale else None
+        try:
+            content, last_modified = self._download(url, last_modified)
+        except StoryFetchError as e:
+            self._failures[url] = (time.monotonic(), str(e))
+            raise
+        now = time.time()
+        anchors = [e["anchor"] for e in self.index.values() if e["url"] == url]
+        if anchor not in anchors:
+            anchors.append(anchor)
+        if content is None:
+            renewed = (self._story_cache.get(url, a) for a in anchors)
+            self._story_cache.put([dict(r, fetched_at=now) for r in renewed
+                                   if r and r.get("last_modified") == last_modified])
+            return
+        stories, errors = extract_book(content, anchors)
+        self._story_cache.put([
+            {"format": CACHE_FORMAT, "url": url, "anchor": a, "fetched_at": now,
+             "last_modified": last_modified, "paragraphs": paragraphs}
+            for a, paragraphs in stories.items()])
+        for a, error in errors.items():
+            self.log.error(f"{url}#{a}: {error}")
+            self._failures[f"{url}#{a}"] = (time.monotonic(), f"{error} in {url}")
 
     def get_story_paragraphs(self, entry):
-        """Extract a single story's paragraphs from its <div class='chapter'>.
-        Unlike ovos-skill-andrew-lang-tales' flat-HTML anchor scheme, this
-        book properly nests each story's content inside its own div, so we
-        can just grab every <p> inside it directly - no need to guess where
-        the story ends by looking for the next anchor.
-
-        Text extraction uses get_text(strip=True) WITHOUT a separator - a
-        real bug found while building this: with separator=' ', drop-cap
-        spans like '<span class="drop">E</span>s war einmal' become 'E s
-        war einmal' (spurious space at the tag boundary, splitting the
-        first word). No separator avoids that, but leaves the original
-        HTML's line-wrapped whitespace (literal newlines) embedded in the
-        text, which the regex below collapses to single spaces."""
-        soup = self._get_book_soup(entry["url"])
-        div = soup.find("div", {"class": "chapter", "id": entry["anchor"]})
-        if div is None:
-            raise StoryFetchError(f"chapter {entry['anchor']} not found in {entry['url']}")
-        paragraphs = []
-        for p in div.find_all("p"):
-            text = re.sub(r"\s+", " ", p.get_text(strip=True)).strip()
-            if text:
-                paragraphs.append(text)
-        if not paragraphs:
-            raise StoryFetchError(f"no story text found at {entry['url']}#{entry['anchor']}")
-        return paragraphs
+        """A story's paragraphs: from the cache when it has them, else by
+        fetching the story's book - once for all the stories in it, see
+        extract_book(). A copy cached longer ago than CACHE_MAX_AGE is
+        still read when the book cannot be fetched again."""
+        url, anchor = entry["url"], entry["anchor"]
+        record = self._story_cache.get(url, anchor)
+        if record and self._story_cache.is_fresh(record):
+            return record["paragraphs"]
+        with self._fetch_lock:
+            # a request for another story of the same book may have
+            # fetched it while this one waited
+            record = self._story_cache.get(url, anchor)
+            if record and self._story_cache.is_fresh(record):
+                return record["paragraphs"]
+            try:
+                self._check_backoff(f"{url}#{anchor}")
+                self._fetch_book(url, anchor, record)
+            except StoryFetchError as e:
+                if record:
+                    self.log.warning(f"{e} - reading the copy cached {time.ctime(record['fetched_at'])}")
+                    return record["paragraphs"]
+                raise
+            record = self._story_cache.get(url, anchor)
+        if record is None:
+            failure = self._failures.get(f"{url}#{anchor}")
+            raise StoryFetchError(failure[1] if failure else f"no story text at {url}#{anchor}")
+        return record["paragraphs"]
 
     def _matches_collection_hint(self, hint):
         if not hint:
