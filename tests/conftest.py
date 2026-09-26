@@ -28,6 +28,7 @@ def skill(monkeypatch):
     s._bus = MagicMock()
     s._settings = {}
     monkeypatch.setattr(BechsteinTales, "lang", "de-de", raising=False)
+    s.served = {"de"}
     s._book_soup_cache = {}
     s.index = {}
     return s

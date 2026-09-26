@@ -21,8 +21,8 @@ regional oral tradition).
 > `ovos-skill-andrew-lang-tales`, just for German instead of English -
 > full fairy tale prose is a bigger translation cost/quality risk than a
 > blog post or abstract. **It answers searches made in German (`de-*`)
-> and stays silent for every other language**, whatever the device's
-> own language is (see "Languages" below).
+> and stays silent for every other language**, and only loads
+> where German is configured - the device language or `secondary_langs` (see "Languages" below).
 
 ## Install
 ```bash
@@ -57,7 +57,20 @@ Two real bugs were found and fixed while building this:
 
 ## Languages
 
-The provider always loads, and decides **per search** whether to answer:
+The provider loads only where German is one of the languages the
+installation is configured for: the device's own `lang`, or one of
+`secondary_langs` in `mycroft.conf`. A single device in another
+language never loads it. A HiveMind hub whose users speak German lists
+it there, even when the hub's own language is something else:
+
+```json
+{
+  "lang": "en-US",
+  "secondary_langs": ["de-DE"]
+}
+```
+
+Once loaded, it decides **per search** whether to answer:
 a search made in German gets an answer, any other language gets none.
 The language of a search is the pipeline plugin's `lang` field, else the
 language of the session the search came from, else (an older plugin
