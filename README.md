@@ -20,11 +20,9 @@ regional oral tradition).
 > **German only, no translation.** Same situation as
 > `ovos-skill-andrew-lang-tales`, just for German instead of English -
 > full fairy tale prose is a bigger translation cost/quality risk than a
-> blog post or abstract. **On any device language other than German,
-> this provider never loads at all**: `initialize()` checks the device's
-> language against `SUPPORTED_LANGUAGES = {"de"}` before loading the
-> index or registering any bus events, logging why. Set your OVOS
-> device's language to German (`de-*`) to use this provider.
+> blog post or abstract. **It answers searches made in German (`de-*`)
+> and stays silent for every other language**, whatever the device's
+> own language is (see "Languages" below).
 
 ## Install
 ```bash
@@ -56,6 +54,32 @@ Two real bugs were found and fixed while building this:
   separator and instead collapsing the source HTML's line-wrapped
   whitespace with a regex - the same class of bug as
   `ovos-skill-ovosblog`'s inline-`<code>` finding, different cause.
+
+## Languages
+
+The provider always loads, and decides **per search** whether to answer:
+a search made in German gets an answer, any other language gets none.
+The language of a search is the pipeline plugin's `lang` field, else the
+language of the session the search came from, else (an older plugin
+sends neither) the device's own language. That matters on a HiveMind
+hub, where one ovos-core serves many users at once, each session in its
+own language: a German session must get these stories on a hub whose own
+language is English, and a French session must not get German ones. A
+`ping` that names a language (the same way) only gets a pong when that
+is German. Fetching a story is never gated on language - it is addressed
+to this provider directly.
+
+## Title matching
+
+Titles match regardless of case, umlauts, punctuation, a leading article
+and a leading "Märchen vom" / "Vom" / "Von", so "rotkäppchen" finds *Das
+Rotkäppchen* and "schlaraffenland" *Das Märchen vom Schlaraffenland* at
+full confidence. The part before a title's first comma, or either half
+of an "X, oder Y" title, counts too, slightly below the whole title:
+"tischlein deck dich" finds *Tischlein deck dich, Esel streck dich,
+Knüppel aus dem Sack*. A search that names no title at all ("erzähl mir
+ein Märchen") gets one random story at confidence 0.9, or 1.0 when it
+named this collection.
 
 ## Collection hints
 

@@ -15,6 +15,8 @@ StoryFetchError = _module.StoryFetchError
 COMMON_READING_SEARCH_RESPONSE = _module.COMMON_READING_SEARCH_RESPONSE
 COMMON_READING_FETCH_CONTENT_RESPONSE = _module.COMMON_READING_FETCH_CONTENT_RESPONSE
 COMMON_READING_PONG = _module.COMMON_READING_PONG
+normalize_title = _module.normalize_title
+title_aliases = _module.title_aliases
 
 
 @pytest.fixture
