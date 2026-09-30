@@ -25,7 +25,7 @@ def _initialize(skill, monkeypatch, native_langs):
 def test_loads_when_de_is_configured(skill, monkeypatch, native_langs):
     _initialize(skill, monkeypatch, native_langs)
     skill._load_index.assert_called_once()
-    assert skill.add_event.call_count == 3
+    assert skill.add_event.call_count == 4  # search, fetch, ping, vocabulary.get
     assert skill.served == {"de"}
 
 
